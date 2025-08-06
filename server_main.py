@@ -28,6 +28,9 @@ async def handle_client(reader, writer):
             else:
                 response = {"type": "LOGIN_FAIL"}
 
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
+
         elif message.get("type") == "REGISTER":
             username = message.get("username")
             password = message.get("password")
@@ -35,6 +38,9 @@ async def handle_client(reader, writer):
                 response = {"type": "REGISTER_SUCCESS"}
             else:
                 response = {"type": "REGISTER_FAIL", "msg": "User exists"}
+
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
 
         elif message.get("type") == "CREATE_ROOM":
             global room_counter
@@ -54,6 +60,9 @@ async def handle_client(reader, writer):
                 "room_id": room_id
             }
 
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
+
         elif message.get("type") == "LIST_ROOMS":
             room_list = []
             for room in rooms.values():
@@ -67,6 +76,9 @@ async def handle_client(reader, writer):
                 "type": "ROOM_LIST",
                 "rooms": room_list
             }
+
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
 
         elif message.get("type") == "JOIN_ROOM":
             room_id = message.get("room_id")
@@ -85,11 +97,19 @@ async def handle_client(reader, writer):
                         "room_id": room_id,
                         "players": rooms[room_id]["players"]
                     }
+                    # ✅ 广播房间刷新消息给所有人
+                    broadcast = json.dumps({
+                        "type": "ROOM_UPDATE",
+                        "players": room["players"]
+                    }) + "\n"
             else:
                 response = {
                     "type": "JOIN_ROOM_FAIL",
                     "msg": "房间不存在"
                 }
+
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
 
         elif message.get("type") == "LEAVE_ROOM":
             username = message.get("username")
@@ -113,8 +133,62 @@ async def handle_client(reader, writer):
                     "msg": "房间不存在"
                 }
 
-        writer.write((json.dumps(response) + "\n").encode())
-        await writer.drain()
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
+
+        elif message.get("type") == "GET_ROOM_INFO":
+            room_id = message.get("room_id")
+            if room_id in rooms:
+                players = rooms[room_id]["players"]
+                response = {
+                    "type": "ROOM_INFO",
+                    "players": players
+                }
+            else:
+                response = {
+                    "type": "ROOM_INFO",
+                    "players": []
+                }
+
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
+
+        elif message.get("type") == "GET_ROOM_STATUS":
+            room_id = message.get("room_id")
+            if room_id in rooms:
+                status = rooms[room_id].get("status", "waiting")
+                response = {
+                    "type": "ROOM_STATUS",
+                    "status": status
+                }
+            else:
+                response = {
+                    "type": "ROOM_STATUS",
+                    "status": "not_found"
+                }
+
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
+
+        elif message.get("type") == "START_GAME":
+            room_id = message.get("room_id")
+            username = message.get("username")
+
+            if room_id in rooms:
+                room = rooms[room_id]
+
+                if room["players"][0] == username:
+                    room["status"] = "playing"
+
+                    response = {"type": "START_GAME_SUCCESS"}
+                else:
+                    response = {"type": "START_GAME_FAIL", "msg": "你不是房主"}
+            else:
+                response = {"type": "START_GAME_FAIL", "msg": "房间不存在"}
+
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
+
 
     print(f"客户端断开：{addr}")
     writer.close()
