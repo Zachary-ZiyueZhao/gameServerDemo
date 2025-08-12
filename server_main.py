@@ -1,10 +1,16 @@
 import asyncio, json
+import traceback
+
 from user_store import verify_login, register_user
 
 rooms = {}
 room_counter = 1000  # 初始房间ID
 
 connections = {}
+
+def all_players_submitted(room):
+    return all(player in room.get("planes", {}) for player in room["players"])
+
 
 async def remove_user_from_rooms(username):
     for room_id in list(rooms.keys()):
@@ -70,7 +76,8 @@ async def handle_client(reader, writer):
                 rooms[room_id] = {
                     "id": room_id,
                     "players": [username],
-                    "status": "waiting"
+                    "status": "waiting",
+                    "planes": {}
                 }
 
                 response = {
@@ -115,7 +122,7 @@ async def handle_client(reader, writer):
                             "room_id": room_id,
                             "players": rooms[room_id]["players"]
                         }
-                        # ✅ 广播房间刷新消息给所有人
+                        # 广播房间刷新消息给所有人
                         broadcast = json.dumps({
                             "type": "ROOM_UPDATE",
                             "players": room["players"]
@@ -206,6 +213,42 @@ async def handle_client(reader, writer):
 
                 writer.write((json.dumps(response) + "\n").encode())
                 await writer.drain()
+
+            elif message.get("type") == "SUBMIT_LAYOUT":
+                room_id = message.get("room_id")
+                username = message.get("username")
+                layout = message.get("layout")
+                if room_id in rooms and username in rooms[room_id]["players"]:
+
+                    if "planes" not in rooms[room_id]:
+                        rooms[room_id]["planes"] = {}
+                    rooms[room_id]["planes"][username] = layout
+
+                    # 判断是否所有玩家都提交了
+                    if all_players_submitted(rooms[room_id]):
+                        # 广播给该房间所有玩家，告诉他们布局都提交了，客户端可以进入下一界面
+                        broadcast_msg = json.dumps({
+                            "type": "ALL_LAYOUTS_SUBMITTED",
+                            "room_id": room_id,
+                            "planes": rooms[room_id]["planes"]
+                        }) + "\n"
+
+                        # rooms[room_id]["players"] 是玩家列表
+                        for player in rooms[room_id]["players"]:
+                            writer_for_player = connections.get(player)
+                            if writer_for_player:
+                                writer_for_player.write(broadcast_msg.encode())
+                                await writer_for_player.drain()
+
+                    response = {"type": "SUBMIT_LAYOUT_SUCCESS"}
+
+                else:
+                    response = {"type": "SUBMIT_LAYOUT_FAIL", "msg": "房间不存在或玩家不在房间"}
+
+                writer.write((json.dumps(response) + "\n").encode())
+                await writer.drain()
+
+
 
     except Exception as e:
         print(f"[异常] {addr}：{e}")
