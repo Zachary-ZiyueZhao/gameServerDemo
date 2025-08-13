@@ -11,6 +11,17 @@ connections = {}
 def all_players_submitted(room):
     return all(player in room.get("planes", {}) for player in room["players"])
 
+async def cleanup_empty_rooms():
+    while True:
+        await asyncio.sleep(5)  # 每 5 秒检查一次
+        empty_rooms = []
+        for room_id, room in list(rooms.items()):
+            if not room.get("players"):
+                empty_rooms.append(room_id)
+
+        for room_id in empty_rooms:
+            del rooms[room_id]
+            print(f"[定时清理] 删除空房间 {room_id}")
 
 async def remove_user_from_rooms(username):
     for room_id in list(rooms.keys()):
@@ -266,6 +277,10 @@ async def handle_client(reader, writer):
 async def main():
     server = await asyncio.start_server(handle_client, '0.0.0.0', 12345)
     print("服务端启动在 12345 端口")
+
+    # 启动定时清理任务
+    asyncio.create_task(cleanup_empty_rooms())
+
     async with server:
         await server.serve_forever()
 
