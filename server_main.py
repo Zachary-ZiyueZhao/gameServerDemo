@@ -11,6 +11,31 @@ connections = {}
 def all_players_submitted(room):
     return all(player in room.get("planes", {}) for player in room["players"])
 
+writer_locks = {}  # username -> asyncio.Lock
+
+async def safe_write(username, data):
+    """安全地向某个玩家写入数据，带锁+异常保护"""
+    if username not in connections:
+        return
+    lock = writer_locks.setdefault(username, asyncio.Lock())
+    async with lock:
+        try:
+            w = connections[username]
+            w.write(data)
+            await w.drain()
+        except Exception as e:
+            print(f"[WARN] 向 {username} 写数据失败: {e}")
+            # 连接失效时移除
+            try:
+                w.close()
+                await w.wait_closed()
+            except:
+                pass
+            if username in connections:
+                del connections[username]
+
+
+
 async def cleanup_empty_rooms():
     while True:
         await asyncio.sleep(5)  # 每 5 秒检查一次
@@ -226,39 +251,38 @@ async def handle_client(reader, writer):
                 await writer.drain()
 
             elif message.get("type") == "SUBMIT_LAYOUT":
-                room_id = message.get("room_id")
-                username = message.get("username")
-                layout = message.get("layout")
-                if room_id in rooms and username in rooms[room_id]["players"]:
+                room_id = message["room_id"]
+                username = message["username"]
+                layout = message["layout"]
 
-                    if "planes" not in rooms[room_id]:
-                        rooms[room_id]["planes"] = {}
-                    rooms[room_id]["planes"][username] = layout
+                if room_id not in rooms or username not in rooms[room_id]["players"]:
+                    await safe_write(username, (json.dumps({"type": "SUBMIT_LAYOUT_FAIL"}) + "\n").encode())
+                    return
 
-                    # 判断是否所有玩家都提交了
-                    if all_players_submitted(rooms[room_id]):
-                        # 广播给该房间所有玩家，告诉他们布局都提交了，客户端可以进入下一界面
-                        broadcast_msg = json.dumps({
-                            "type": "ALL_LAYOUTS_SUBMITTED",
-                            "room_id": room_id,
-                            "planes": rooms[room_id]["planes"]
-                        }) + "\n"
+                # 保存玩家布局
+                rooms[room_id].setdefault("planes", {})[username] = layout
 
-                        # rooms[room_id]["players"] 是玩家列表
+                # 单独回复提交成功
+                await safe_write(username, (json.dumps({"type": "SUBMIT_LAYOUT_SUCCESS"}) + "\n").encode())
+
+                # 检查是否所有人都提交了
+                if all_players_submitted(rooms[room_id]):
+
+                    broadcast_msg = (json.dumps({
+                        "type": "ALL_LAYOUTS_SUBMITTED",
+                        "room_id": room_id,
+                        "planes": rooms[room_id]["planes"]
+                    }) + "\n")
+
+                    for player in rooms[room_id]["players"]:
+                        await safe_write(player, broadcast_msg.encode())
                         for player in rooms[room_id]["players"]:
-                            writer_for_player = connections.get(player)
-                            if writer_for_player:
-                                writer_for_player.write(broadcast_msg.encode())
-                                await writer_for_player.drain()
-
-                    response = {"type": "SUBMIT_LAYOUT_SUCCESS"}
-
+                            await safe_write(player, broadcast_msg.encode())
                 else:
                     response = {"type": "SUBMIT_LAYOUT_FAIL", "msg": "房间不存在或玩家不在房间"}
 
-                writer.write((json.dumps(response) + "\n").encode())
-                await writer.drain()
-
+                    writer.write((json.dumps(response) + "\n").encode())
+                    await writer.drain()
 
 
     except Exception as e:
