@@ -267,22 +267,115 @@ async def handle_client(reader, writer):
 
                 # 检查是否所有人都提交了
                 if all_players_submitted(rooms[room_id]):
-
-                    broadcast_msg = (json.dumps({
+                    broadcast_msg = json.dumps({
                         "type": "ALL_LAYOUTS_SUBMITTED",
                         "room_id": room_id,
                         "planes": rooms[room_id]["planes"]
-                    }) + "\n")
+                    }) + "\n"
 
                     for player in rooms[room_id]["players"]:
                         await safe_write(player, broadcast_msg.encode())
-                        for player in rooms[room_id]["players"]:
-                            await safe_write(player, broadcast_msg.encode())
+                        await asyncio.sleep(0)  # 让事件循环切换，保证消息不漏
+
                 else:
                     response = {"type": "SUBMIT_LAYOUT_FAIL", "msg": "房间不存在或玩家不在房间"}
 
                     writer.write((json.dumps(response) + "\n").encode())
                     await writer.drain()
+
+            elif message.get("type") == "ENTER_GAME":
+                room_id = message["room_id"]
+                username = message["username"]
+                if room_id not in rooms:
+                    return
+                room = rooms[room_id]
+                room.setdefault("entered", set()).add(username)
+
+                if len(room["entered"]) == len(room["players"]):
+                    # 所有人都进入了
+                    first_player = room["players"][0]
+                    for p in room["players"]:
+                        if p == first_player:
+                            await safe_write(p, (json.dumps({"type": "YOUR_TURN"}) + "\n").encode())
+                        else:
+                            await safe_write(p, (json.dumps({"type": "NOT_YOUR_TURN"}) + "\n").encode())
+
+            elif message.get("type") == "ATTACK":
+                room_id = message.get("room_id")
+                username = message.get("username")
+                x = message.get("x")
+                y = message.get("y")
+
+                if room_id not in rooms:
+                    return
+
+                room = rooms[room_id]
+                if username not in room["players"]:
+                    return
+
+                opponents = [p for p in room["players"] if p != username]
+                if not opponents:
+                    return
+
+                opponent = opponents[0]
+                planes = room["planes"].get(opponent, [])
+
+                hit_type = "未击中"
+                hit_plane_id = None
+                for plane in planes:
+                    if plane["hp"] <= 0:
+                        # 🚨 如果已经坠毁，依然返回“击中”
+                        for cell in plane["cells"]:
+                            if cell["x"] == x and cell["y"] == y:
+                                hit_type = "击中"
+                                break
+                        if hit_type == "击中":
+                            break
+
+                    for cell in plane["cells"]:
+                        if cell["x"] == x and cell["y"] == y:
+                            dmg = cell["damage"]
+                            plane["hp"] -= dmg
+                            if plane["hp"] <= 0:
+                                hit_type = "坠毁"
+                                plane["hp"] = 9999  # 🚨 防止之后再坠毁
+                            else:
+                                hit_type = "击中"
+                            hit_plane_id = plane["id"]
+                            break
+                    if hit_type != "未击中":
+                        break
+
+                print(f"[ATTACK] {username} 攻击 ({x},{y}) -> {hit_type}" +
+                      (f" 飞机 {hit_plane_id}" if hit_plane_id else ""))
+
+                # 1. 回复攻击方结果
+                response = {
+                    "type": "ATTACK_RESULT",
+                    "result": hit_type,
+                    "x": x,
+                    "y": y
+                }
+                await safe_write(username, (json.dumps(response) + "\n").encode())
+
+                # 2. 通知被攻击方
+                under_attack = {
+                    "type": "UNDER_ATTACK",
+                    "x": x,
+                    "y": y,
+                    "result": hit_type
+                }
+                await safe_write(opponent, (json.dumps(under_attack) + "\n").encode())
+
+                # 3. 🔄 切换回合
+                turn_switch = [
+                    (username, "NOT_YOUR_TURN"),
+                    (opponent, "YOUR_TURN")
+                ]
+
+                for u, t in turn_switch:
+                    await safe_write(u, (json.dumps({"type": t}) + "\n").encode())
+                    await asyncio.sleep(0)
 
 
     except Exception as e:
