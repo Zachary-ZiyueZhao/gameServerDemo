@@ -322,9 +322,12 @@ async def handle_client(reader, writer):
 
                 hit_type = "未击中"
                 hit_plane_id = None
+                global_dmg = None
+                dmg = None
+
                 for plane in planes:
                     if plane["hp"] <= 0:
-                        # 🚨 如果已经坠毁，依然返回“击中”
+                        # 🚨 已坠毁飞机仍可能被击中
                         for cell in plane["cells"]:
                             if cell["x"] == x and cell["y"] == y:
                                 hit_type = "击中"
@@ -335,10 +338,11 @@ async def handle_client(reader, writer):
                     for cell in plane["cells"]:
                         if cell["x"] == x and cell["y"] == y:
                             dmg = cell["damage"]
+                            global_dmg = dmg
                             plane["hp"] -= dmg
                             if plane["hp"] <= 0:
                                 hit_type = "坠毁"
-                                plane["hp"] = 9999  # 🚨 防止之后再坠毁
+                                plane["hp"] = 9999  # ✅ 保持 0 表示坠毁
                             else:
                                 hit_type = "击中"
                             hit_plane_id = plane["id"]
@@ -354,7 +358,8 @@ async def handle_client(reader, writer):
                     "type": "ATTACK_RESULT",
                     "result": hit_type,
                     "x": x,
-                    "y": y
+                    "y": y,
+                    "dmg": global_dmg
                 }
                 await safe_write(username, (json.dumps(response) + "\n").encode())
 
@@ -363,11 +368,23 @@ async def handle_client(reader, writer):
                     "type": "UNDER_ATTACK",
                     "x": x,
                     "y": y,
-                    "result": hit_type
+                    "result": hit_type,
+                    "dmg": dmg
                 }
                 await safe_write(opponent, (json.dumps(under_attack) + "\n").encode())
 
-                # 3. 🔄 切换回合
+                # ✅ 3. 胜负判定
+                all_destroyed = all(p["hp"] >= 100 for p in planes)
+                if all_destroyed:
+                    print(f"[GAME OVER] {username} 获胜, {opponent} 失败")
+
+                    await safe_write(username, (json.dumps({"type": "WIN"}) + "\n").encode())
+                    await safe_write(opponent, (json.dumps({"type": "LOSE"}) + "\n").encode())
+
+                    room["status"] = "finished"
+                    return  # ✅ 不再切换回合
+
+                # 4. 🔄 切换回合（只有没结束才切换）
                 turn_switch = [
                     (username, "NOT_YOUR_TURN"),
                     (opponent, "YOUR_TURN")
