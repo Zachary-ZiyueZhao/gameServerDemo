@@ -1,421 +1,318 @@
-import asyncio, json
-import traceback
+import asyncio
+import json
+from dataclasses import dataclass, field
+from secrets import randbelow
 
-from user_store import verify_login, register_user
+from user_store import register_user, verify_login
 
-rooms = {}
-room_counter = 1000  # 初始房间ID
+BOARD_SIZE = 10
+MAX_PLAYERS = 2
+PLANE_COUNT = 3
+PLANE_HP = 10
+BASE_DAMAGE = (
+    (0, 0, 10, 0, 0),
+    (2, 2, 5, 2, 2),
+    (0, 0, 5, 0, 0),
+    (0, 3, 3, 3, 0),
+)
 
-connections = {}
 
-def all_players_submitted(room):
-    return all(player in room.get("planes", {}) for player in room["players"])
+@dataclass
+class Room:
+    room_id: str
+    players: list[str]
+    status: str = "waiting"  # waiting -> placing -> playing -> finished
+    planes: dict[str, list[dict]] = field(default_factory=dict)
+    entered_players: set[str] = field(default_factory=set)
+    attacked_cells: dict[str, set[tuple[int, int]]] = field(default_factory=dict)
+    current_turn: str | None = None
 
-writer_locks = {}  # username -> asyncio.Lock
 
-async def safe_write(username, data):
-    """安全地向某个玩家写入数据，带锁+异常保护"""
-    if username not in connections:
+rooms: dict[str, Room] = {}
+connections: dict[str, asyncio.StreamWriter] = {}
+writer_locks: dict[str, asyncio.Lock] = {}
+
+
+def generate_room_id() -> str:
+    """Return a six-digit room number that is not currently in use."""
+    while True:
+        room_id = f"{randbelow(900_000) + 100_000}"
+        if room_id not in rooms:
+            return room_id
+
+
+async def send_to(username: str, message: dict) -> None:
+    writer = connections.get(username)
+    if writer is None:
         return
+
     lock = writer_locks.setdefault(username, asyncio.Lock())
     async with lock:
         try:
-            w = connections[username]
-            w.write(data)
-            await w.drain()
-        except Exception as e:
-            print(f"[WARN] 向 {username} 写数据失败: {e}")
-            # 连接失效时移除
-            try:
-                w.close()
-                await w.wait_closed()
-            except:
-                pass
-            if username in connections:
-                del connections[username]
+            writer.write((json.dumps(message, ensure_ascii=False) + "\n").encode())
+            await writer.drain()
+        except (ConnectionError, OSError):
+            await disconnect_user(username)
 
 
+async def broadcast(room: Room, message: dict) -> None:
+    await asyncio.gather(*(send_to(player, message) for player in room.players))
 
-async def cleanup_empty_rooms():
-    while True:
-        await asyncio.sleep(5)  # 每 5 秒检查一次
-        empty_rooms = []
-        for room_id, room in list(rooms.items()):
-            if not room.get("players"):
-                empty_rooms.append(room_id)
 
-        for room_id in empty_rooms:
-            del rooms[room_id]
-            print(f"[定时清理] 删除空房间 {room_id}")
+async def publish_room_update(room: Room) -> None:
+    await broadcast(room, {
+        "type": "ROOM_UPDATE",
+        "room_id": room.room_id,
+        "players": room.players,
+        "status": room.status,
+    })
 
-async def remove_user_from_rooms(username):
-    for room_id in list(rooms.keys()):
-        room = rooms[room_id]
-        if username in room["players"]:
-            index = room["players"].index(username)
-            room["players"].pop(index)
-            room["writers"].pop(index)
-            print(f"已将 {username} 从房间 {room_id} 移除")
 
-            # 如果没人了，清除房间
-            if not room["players"]:
-                del rooms[room_id]
-                print(f"房间 {room_id} 已清除（无人）")
-            break
+def room_list() -> list[dict]:
+    return [
+        {"id": room.room_id, "players": len(room.players), "status": room.status}
+        for room in rooms.values()
+    ]
 
-async def handle_client(reader, writer):
-    addr = writer.get_extra_info('peername')
-    username = None
-    print(f"客户端连接：{addr}")
+
+def rotate_damage(damage_map: tuple[tuple[int, ...], ...]) -> tuple[tuple[int, ...], ...]:
+    rows, columns = len(damage_map), len(damage_map[0])
+    return tuple(tuple(damage_map[rows - 1 - column][row] for column in range(rows)) for row in range(columns))
+
+
+def build_plane(plane_id: int, x: int, y: int, rotation: int) -> dict | None:
+    damage_map = BASE_DAMAGE
+    for _ in range(rotation):
+        damage_map = rotate_damage(damage_map)
+
+    cells = []
+    for row, damage_row in enumerate(damage_map):
+        for column, damage in enumerate(damage_row):
+            if damage == 0:
+                continue
+            cell_x, cell_y = x + column, y + row
+            if not (0 <= cell_x < BOARD_SIZE and 0 <= cell_y < BOARD_SIZE):
+                return None
+            cells.append({"x": cell_x, "y": cell_y, "damage": damage})
+    return {"id": plane_id, "head_x": x, "head_y": y, "rotation": rotation, "hp": PLANE_HP, "cells": cells}
+
+
+def normalize_layout(layout: object) -> list[dict] | None:
+    """Build the authoritative aircraft data from positions only."""
+    if not isinstance(layout, list) or len(layout) != PLANE_COUNT:
+        return None
+    occupied: set[tuple[int, int]] = set()
+    normalized = []
+    for plane_id, plane in enumerate(layout, start=1):
+        if not isinstance(plane, dict):
+            return None
+        x, y, rotation = plane.get("head_x"), plane.get("head_y"), plane.get("rotation")
+        if not all(isinstance(value, int) for value in (x, y, rotation)) or rotation not in range(4):
+            return None
+        plane_data = build_plane(plane_id, x, y, rotation)
+        if plane_data is None:
+            return None
+        for cell in plane_data["cells"]:
+            position = (cell["x"], cell["y"])
+            if position in occupied:
+                return None
+            occupied.add(position)
+        normalized.append(plane_data)
+    return normalized
+
+
+def find_room_for_player(username: str) -> Room | None:
+    return next((room for room in rooms.values() if username in room.players), None)
+
+
+async def remove_from_room(username: str) -> None:
+    room = find_room_for_player(username)
+    if room is None:
+        return
+
+    room.players.remove(username)
+    room.planes.pop(username, None)
+    room.entered_players.discard(username)
+    room.attacked_cells.pop(username, None)
+    if not room.players:
+        rooms.pop(room.room_id, None)
+        return
+
+    if room.status in {"placing", "playing"}:
+        await broadcast(room, {"type": "OPPONENT_LEFT", "room_id": room.room_id})
+        rooms.pop(room.room_id, None)
+        return
+    await publish_room_update(room)
+
+
+async def disconnect_user(username: str) -> None:
+    connections.pop(username, None)
+    writer_locks.pop(username, None)
+    await remove_from_room(username)
+
+
+async def handle_attack(username: str, message: dict) -> None:
+    room = find_room_for_player(username)
+    if room is None or room.room_id != message.get("room_id"):
+        await send_to(username, {"type": "ERROR", "msg": "你不在此房间中"})
+        return
+    if room.status != "playing" or room.current_turn != username:
+        await send_to(username, {"type": "ERROR", "msg": "现在不能攻击"})
+        return
+    x, y = message.get("x"), message.get("y")
+    if not isinstance(x, int) or not isinstance(y, int) or not (0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE):
+        await send_to(username, {"type": "ERROR", "msg": "攻击坐标无效"})
+        return
+    attacks = room.attacked_cells.setdefault(username, set())
+    if (x, y) in attacks:
+        await send_to(username, {"type": "ERROR", "msg": "该位置已经攻击过"})
+        return
+    attacks.add((x, y))
+
+    opponent = next(player for player in room.players if player != username)
+    hit_type, damage = "未击中", 0
+    target_planes = room.planes[opponent]
+    for plane in target_planes:
+        if plane["hp"] <= 0:
+            continue
+        hit_cell = next((cell for cell in plane["cells"] if cell["x"] == x and cell["y"] == y), None)
+        if hit_cell is None:
+            continue
+        damage = hit_cell["damage"]
+        plane["hp"] = max(0, plane["hp"] - damage)
+        hit_type = "坠毁" if plane["hp"] == 0 else "击中"
+        break
+
+    await send_to(username, {"type": "ATTACK_RESULT", "result": hit_type, "x": x, "y": y, "dmg": damage})
+    await send_to(opponent, {"type": "UNDER_ATTACK", "x": x, "y": y, "result": hit_type, "dmg": damage})
+    if all(plane["hp"] == 0 for plane in target_planes):
+        room.status = "finished"
+        room.current_turn = None
+        await send_to(username, {"type": "WIN"})
+        await send_to(opponent, {"type": "LOSE"})
+        rooms.pop(room.room_id, None)
+        return
+
+    room.current_turn = opponent
+    await send_to(username, {"type": "NOT_YOUR_TURN"})
+    await send_to(opponent, {"type": "YOUR_TURN"})
+
+
+async def handle_message(username: str | None, message: dict) -> None:
+    message_type = message.get("type")
+    if username is None:
+        return
+
+    if message_type == "LIST_ROOMS":
+        await send_to(username, {"type": "ROOM_LIST", "rooms": room_list()})
+    elif message_type == "CREATE_ROOM":
+        if find_room_for_player(username) is not None:
+            await send_to(username, {"type": "CREATE_ROOM_FAIL", "msg": "请先离开当前房间"})
+        else:
+            room_id = generate_room_id()
+            room = Room(room_id=room_id, players=[username])
+            rooms[room_id] = room
+            await send_to(username, {"type": "CREATE_ROOM_SUCCESS", "room_id": room_id, "players": room.players})
+    elif message_type == "JOIN_ROOM":
+        room = rooms.get(message.get("room_id"))
+        if room is None or room.status != "waiting":
+            await send_to(username, {"type": "JOIN_ROOM_FAIL", "msg": "房间不存在或不能加入"})
+        elif find_room_for_player(username) is not None:
+            await send_to(username, {"type": "JOIN_ROOM_FAIL", "msg": "请先离开当前房间"})
+        elif len(room.players) >= MAX_PLAYERS:
+            await send_to(username, {"type": "JOIN_ROOM_FAIL", "msg": "房间已满"})
+        else:
+            room.players.append(username)
+            await send_to(username, {"type": "JOIN_ROOM_SUCCESS", "room_id": room.room_id, "players": room.players})
+            await publish_room_update(room)
+    elif message_type == "LEAVE_ROOM":
+        await remove_from_room(username)
+        await send_to(username, {"type": "LEAVE_ROOM_SUCCESS"})
+    elif message_type == "START_GAME":
+        room = find_room_for_player(username)
+        if room is None or room.room_id != message.get("room_id"):
+            await send_to(username, {"type": "START_GAME_FAIL", "msg": "房间不存在"})
+        elif room.players[0] != username or len(room.players) != MAX_PLAYERS:
+            await send_to(username, {"type": "START_GAME_FAIL", "msg": "需要房主和两名玩家才能开始"})
+        else:
+            room.status = "placing"
+            room.planes.clear()
+            room.entered_players.clear()
+            room.attacked_cells.clear()
+            await broadcast(room, {"type": "GAME_STARTED", "room_id": room.room_id})
+            await publish_room_update(room)
+    elif message_type == "SUBMIT_LAYOUT":
+        room = find_room_for_player(username)
+        layout = normalize_layout(message.get("layout"))
+        if room is None or room.room_id != message.get("room_id") or room.status != "placing" or layout is None:
+            await send_to(username, {"type": "SUBMIT_LAYOUT_FAIL", "msg": "布局无效或游戏状态不正确"})
+        else:
+            room.planes[username] = layout
+            await send_to(username, {"type": "SUBMIT_LAYOUT_SUCCESS"})
+            if len(room.planes) == len(room.players):
+                await broadcast(room, {"type": "ALL_LAYOUTS_SUBMITTED", "room_id": room.room_id, "planes": room.planes})
+    elif message_type == "ENTER_GAME":
+        room = find_room_for_player(username)
+        if room is not None and room.room_id == message.get("room_id") and len(room.planes) == len(room.players):
+            room.entered_players.add(username)
+            if len(room.entered_players) == len(room.players):
+                room.status, room.current_turn = "playing", room.players[0]
+                await send_to(room.current_turn, {"type": "YOUR_TURN"})
+                await send_to(room.players[1], {"type": "NOT_YOUR_TURN"})
+    elif message_type == "ATTACK":
+        await handle_attack(username, message)
+    else:
+        await send_to(username, {"type": "ERROR", "msg": "未知请求"})
+
+
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    username: str | None = None
+    peer = writer.get_extra_info("peername")
     try:
-        while True:
-            data = await reader.readline()
-            if not data:
-                break
+        while line := await reader.readline():
             try:
-                message = json.loads(data.decode())
+                message = json.loads(line)
             except json.JSONDecodeError:
                 continue
-
-            response = {"type": "ERROR", "msg": "Unknown request"}
-
-            if message.get("type") == "LOGIN":
-                username = message.get("username")
-                password = message.get("password")
-                if verify_login(username, password):
-                    connections[username] = writer
-                    response = {"type": "LOGIN_SUCCESS"}
-                else:
-                    response = {"type": "LOGIN_FAIL"}
-
-                writer.write((json.dumps(response) + "\n").encode())
+            if not isinstance(message, dict):
+                continue
+            message_type = message.get("type")
+            if message_type == "REGISTER":
+                requested_name, password = message.get("username"), message.get("password")
+                success = isinstance(requested_name, str) and isinstance(password, str) and register_user(requested_name, password)
+                writer.write((json.dumps({"type": "REGISTER_SUCCESS" if success else "REGISTER_FAIL"}, ensure_ascii=False) + "\n").encode())
                 await writer.drain()
-
-            elif message.get("type") == "REGISTER":
-                username = message.get("username")
-                password = message.get("password")
-                if register_user(username, password):
-                    response = {"type": "REGISTER_SUCCESS"}
-                else:
-                    response = {"type": "REGISTER_FAIL", "msg": "User exists"}
-
-                writer.write((json.dumps(response) + "\n").encode())
-                await writer.drain()
-
-            elif message.get("type") == "CREATE_ROOM":
-                global room_counter
-                username = message.get("username")
-                room_id = str(room_counter)
-                room_counter += 1
-
-                # 创建新房间并加入玩家
-                rooms[room_id] = {
-                    "id": room_id,
-                    "players": [username],
-                    "status": "waiting",
-                    "planes": {}
-                }
-
-                response = {
-                    "type": "CREATE_ROOM_SUCCESS",
-                    "room_id": room_id
-                }
-
-                writer.write((json.dumps(response) + "\n").encode())
-                await writer.drain()
-
-            elif message.get("type") == "LIST_ROOMS":
-                room_list = []
-                for room in rooms.values():
-                    room_list.append({
-                        "id": room["id"],
-                        "players": len(room["players"]),
-                        "status": room["status"]
-                    })
-
-                response = {
-                    "type": "ROOM_LIST",
-                    "rooms": room_list
-                }
-
-                writer.write((json.dumps(response) + "\n").encode())
-                await writer.drain()
-
-            elif message.get("type") == "JOIN_ROOM":
-                room_id = message.get("room_id")
-                username = message.get("username")
-
-                if room_id in rooms:
-                    if username in rooms[room_id]["players"]:
-                        response = {
-                            "type": "JOIN_ROOM_FAIL",
-                            "msg": "你已经在该房间中"
-                        }
-                    else:
-                        rooms[room_id]["players"].append(username)
-                        response = {
-                            "type": "JOIN_ROOM_SUCCESS",
-                            "room_id": room_id,
-                            "players": rooms[room_id]["players"]
-                        }
-                        # 广播房间刷新消息给所有人
-                        broadcast = json.dumps({
-                            "type": "ROOM_UPDATE",
-                            "players": room["players"]
-                        }) + "\n"
-                else:
-                    response = {
-                        "type": "JOIN_ROOM_FAIL",
-                        "msg": "房间不存在"
-                    }
-
-                writer.write((json.dumps(response) + "\n").encode())
-                await writer.drain()
-
-            elif message.get("type") == "LEAVE_ROOM":
-                username = message.get("username")
-                room_id = message.get("room_id")
-
-                if room_id in rooms:
-                    room = rooms[room_id]
-                    if username in room["players"]:
-                        room["players"].remove(username)
-
-                        # 如果房间没人了，删除房间
-                        if not room["players"]:
-                            del rooms[room_id]
-
-                    response = {
-                        "type": "LEAVE_ROOM_SUCCESS"
-                    }
-                else:
-                    response = {
-                        "type": "LEAVE_ROOM_FAIL",
-                        "msg": "房间不存在"
-                    }
-
-                writer.write((json.dumps(response) + "\n").encode())
-                await writer.drain()
-
-            elif message.get("type") == "GET_ROOM_INFO":
-                room_id = message.get("room_id")
-                if room_id in rooms:
-                    players = rooms[room_id]["players"]
-                    response = {
-                        "type": "ROOM_INFO",
-                        "players": players
-                    }
-                else:
-                    response = {
-                        "type": "ROOM_INFO",
-                        "players": []
-                    }
-
-                writer.write((json.dumps(response) + "\n").encode())
-                await writer.drain()
-
-            elif message.get("type") == "GET_ROOM_STATUS":
-                room_id = message.get("room_id")
-                if room_id in rooms:
-                    status = rooms[room_id].get("status", "waiting")
-                    response = {
-                        "type": "ROOM_STATUS",
-                        "status": status
-                    }
-                else:
-                    response = {
-                        "type": "ROOM_STATUS",
-                        "status": "not_found"
-                    }
-
-                writer.write((json.dumps(response) + "\n").encode())
-                await writer.drain()
-
-            elif message.get("type") == "START_GAME":
-                room_id = message.get("room_id")
-                username = message.get("username")
-
-                if room_id in rooms:
-                    room = rooms[room_id]
-
-                    if room["players"][0] == username:
-                        room["status"] = "playing"
-
-                        response = {"type": "START_GAME_SUCCESS"}
-                    else:
-                        response = {"type": "START_GAME_FAIL", "msg": "你不是房主"}
-                else:
-                    response = {"type": "START_GAME_FAIL", "msg": "房间不存在"}
-
-                writer.write((json.dumps(response) + "\n").encode())
-                await writer.drain()
-
-            elif message.get("type") == "SUBMIT_LAYOUT":
-                room_id = message["room_id"]
-                username = message["username"]
-                layout = message["layout"]
-
-                if room_id not in rooms or username not in rooms[room_id]["players"]:
-                    await safe_write(username, (json.dumps({"type": "SUBMIT_LAYOUT_FAIL"}) + "\n").encode())
-                    return
-
-                # 保存玩家布局
-                rooms[room_id].setdefault("planes", {})[username] = layout
-
-                # 单独回复提交成功
-                await safe_write(username, (json.dumps({"type": "SUBMIT_LAYOUT_SUCCESS"}) + "\n").encode())
-
-                # 检查是否所有人都提交了
-                if all_players_submitted(rooms[room_id]):
-                    broadcast_msg = json.dumps({
-                        "type": "ALL_LAYOUTS_SUBMITTED",
-                        "room_id": room_id,
-                        "planes": rooms[room_id]["planes"]
-                    }) + "\n"
-
-                    for player in rooms[room_id]["players"]:
-                        await safe_write(player, broadcast_msg.encode())
-                        await asyncio.sleep(0)  # 让事件循环切换，保证消息不漏
-
-                else:
-                    response = {"type": "SUBMIT_LAYOUT_FAIL", "msg": "房间不存在或玩家不在房间"}
-
-                    writer.write((json.dumps(response) + "\n").encode())
+                continue
+            if message_type == "LOGIN":
+                requested_name, password = message.get("username"), message.get("password")
+                if username is not None or not isinstance(requested_name, str) or not isinstance(password, str) or not verify_login(requested_name, password):
+                    writer.write((json.dumps({"type": "LOGIN_FAIL"}, ensure_ascii=False) + "\n").encode())
                     await writer.drain()
-
-            elif message.get("type") == "ENTER_GAME":
-                room_id = message["room_id"]
-                username = message["username"]
-                if room_id not in rooms:
-                    return
-                room = rooms[room_id]
-                room.setdefault("entered", set()).add(username)
-
-                if len(room["entered"]) == len(room["players"]):
-                    # 所有人都进入了
-                    first_player = room["players"][0]
-                    for p in room["players"]:
-                        if p == first_player:
-                            await safe_write(p, (json.dumps({"type": "YOUR_TURN"}) + "\n").encode())
-                        else:
-                            await safe_write(p, (json.dumps({"type": "NOT_YOUR_TURN"}) + "\n").encode())
-
-            elif message.get("type") == "ATTACK":
-                room_id = message.get("room_id")
-                username = message.get("username")
-                x = message.get("x")
-                y = message.get("y")
-
-                if room_id not in rooms:
-                    return
-
-                room = rooms[room_id]
-                if username not in room["players"]:
-                    return
-
-                opponents = [p for p in room["players"] if p != username]
-                if not opponents:
-                    return
-
-                opponent = opponents[0]
-                planes = room["planes"].get(opponent, [])
-
-                hit_type = "未击中"
-                hit_plane_id = None
-                global_dmg = None
-                dmg = None
-
-                for plane in planes:
-                    if plane["hp"] <= 0:
-                        # 🚨 已坠毁飞机仍可能被击中
-                        for cell in plane["cells"]:
-                            if cell["x"] == x and cell["y"] == y:
-                                hit_type = "击中"
-                                break
-                        if hit_type == "击中":
-                            break
-
-                    for cell in plane["cells"]:
-                        if cell["x"] == x and cell["y"] == y:
-                            dmg = cell["damage"]
-                            global_dmg = dmg
-                            plane["hp"] -= dmg
-                            if plane["hp"] <= 0:
-                                hit_type = "坠毁"
-                                plane["hp"] = 9999  # ✅ 保持 0 表示坠毁
-                            else:
-                                hit_type = "击中"
-                            hit_plane_id = plane["id"]
-                            break
-                    if hit_type != "未击中":
-                        break
-
-                print(f"[ATTACK] {username} 攻击 ({x},{y}) -> {hit_type}" +
-                      (f" 飞机 {hit_plane_id}" if hit_plane_id else ""))
-
-                # 1. 回复攻击方结果
-                response = {
-                    "type": "ATTACK_RESULT",
-                    "result": hit_type,
-                    "x": x,
-                    "y": y,
-                    "dmg": global_dmg
-                }
-                await safe_write(username, (json.dumps(response) + "\n").encode())
-
-                # 2. 通知被攻击方
-                under_attack = {
-                    "type": "UNDER_ATTACK",
-                    "x": x,
-                    "y": y,
-                    "result": hit_type,
-                    "dmg": dmg
-                }
-                await safe_write(opponent, (json.dumps(under_attack) + "\n").encode())
-
-                # ✅ 3. 胜负判定
-                all_destroyed = all(p["hp"] >= 100 for p in planes)
-                if all_destroyed:
-                    print(f"[GAME OVER] {username} 获胜, {opponent} 失败")
-
-                    await safe_write(username, (json.dumps({"type": "WIN"}) + "\n").encode())
-                    await safe_write(opponent, (json.dumps({"type": "LOSE"}) + "\n").encode())
-
-                    room["status"] = "finished"
-                    return  # ✅ 不再切换回合
-
-                # 4. 🔄 切换回合（只有没结束才切换）
-                turn_switch = [
-                    (username, "NOT_YOUR_TURN"),
-                    (opponent, "YOUR_TURN")
-                ]
-
-                for u, t in turn_switch:
-                    await safe_write(u, (json.dumps({"type": t}) + "\n").encode())
-                    await asyncio.sleep(0)
+                    continue
+                old_writer = connections.get(requested_name)
+                username = requested_name
+                connections[username] = writer
+                if old_writer is not None and old_writer is not writer:
+                    old_writer.close()
+                await send_to(username, {"type": "LOGIN_SUCCESS"})
+                continue
+            await handle_message(username, message)
+    except (ConnectionError, asyncio.IncompleteReadError):
+        pass
+    finally:
+        if username is not None and connections.get(username) is writer:
+            await disconnect_user(username)
+        writer.close()
+        await writer.wait_closed()
+        print(f"客户端断开：{peer}")
 
 
-    except Exception as e:
-        print(f"[异常] {addr}：{e}")
-
-        print(f"客户端断开：{addr}")
-        if username:
-            await remove_user_from_rooms(username)
-            if username in connections:
-                del connections[username]
-
-    writer.close()
-    await writer.wait_closed()
-
-# 启动服务端
-async def main():
-    server = await asyncio.start_server(handle_client, '0.0.0.0', 12345)
+async def main() -> None:
+    server = await asyncio.start_server(handle_client, "0.0.0.0", 12345)
     print("服务端启动在 12345 端口")
-
-    # 启动定时清理任务
-    asyncio.create_task(cleanup_empty_rooms())
-
     async with server:
         await server.serve_forever()
 
-asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())
